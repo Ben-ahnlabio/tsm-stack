@@ -1,4 +1,4 @@
-AWSTemplateFormatVersion: '2010-09-09'
+AWSTemplateFormatVersion: "2010-09-09"
 Description: |
   ABC TSM KMS Stack
 Parameters:
@@ -10,7 +10,7 @@ Parameters:
   Namespace:
     Type: String
     MaxLength: 30
-    AllowedPattern: '^[a-z]*$'
+    AllowedPattern: "^[a-z]*$"
     ConstraintDescription: Must be up to 30 characters, and can only include lowercase letters.
     Description: A Unique namespace for the Builder Vault.
     Default: abcdev
@@ -18,18 +18,26 @@ Parameters:
     Type: String
     Description: The index of the node. This must correspond to the Builder Vault node index that this key will be used for.
     AllowedValues:
-    - "1"
-    - "2"
+      - "1"
+      - "2"
   DeletePolicy:
     Type: String
     Default: Delete
     AllowedValues:
-    - Delete
-    - Retain
+      - Delete
+      - Retain
     Description: |
       The policy to apply when the stack is deleted. Only use Delete if you
       want to delete the resources created by this stack. Retain will keep the resources
       and you will have to manually delete them.
+  CreatorFunctionS3Bucket:
+    Type: String
+    Description: The S3 bucket where the creator function code is stored.
+    Default: abc-tsm
+  CreatorFunctionS3Key:
+    Type: String
+    Description: The S3 key where the creator function code is stored.
+    Default: function/ApiKeyCreatorFunction.zip
 
 Resources:
   NodeSecretManagerKMSKey:
@@ -78,7 +86,10 @@ Resources:
       Value: !Sub >
         {
           "NODE_KMS_KEY_SECRETS_MANAGER_ARN": "${NodeSecretManagerKMSKey.Arn}",
-          "NODE_PUBLIC_KEY_SECERT_ARN": "${NodePublicKey}"
+          "NODE_PRIVATE_KEY_SECRET_ARN": "${NodePrivateKey}",
+          "NODE_PUBLIC_KEY_SECERT_ARN": "${NodePublicKey}",
+          "NODE_API_KEY_SECRET_ARN": "${NodeAPIKey}",
+          "NODE_MASTER_ENCRYPTION_KEY_SECRET_ARN": "${NodeMasterEncryptionKey}"
         }
 
   NodeSSMParameterShare:
@@ -175,13 +186,75 @@ Resources:
       Description: !Sub DB master encryptor password for builder vault node ${NodeIndex}
       KmsKeyId: !Ref NodeSecretManagerKMSKey
       GenerateSecretString:
-        PasswordLength: 1
+        PasswordLength: 10
         RequireEachIncludedType: False
       Tags:
         - Key: Namespace
           Value: !Sub ${Namespace}
         - Key: NodeIndex
           Value: !Sub ${NodeIndex}
+
+  APIKeyCreatorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: APIKeyCreatorFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                  - kms:ReEncrypt
+                Resource:
+                  - !GetAtt NodeSecretManagerKMSKey.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:PutSecretValue
+                Resource:
+                  - !Sub ${NodeAPIKey}
+                  - !Sub ${NodePrivateKey}
+                  - !Sub ${NodePublicKey}
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*"
+
+  APIKeyCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: app.lambda_handler
+      Role: !GetAtt APIKeyCreatorFunctionRole.Arn
+      Runtime: python3.11
+      Timeout: 20
+      Environment:
+        Variables:
+          NODE_API_KEY_SECRET_ARN: !Ref NodeAPIKey
+          NODE_PRIVATE_KEY_SECRET_ARN: !Ref NodePrivateKey
+          NODE_PUBLIC_KEY_SECRET_ARN: !Ref NodePublicKey
+      Code:
+        S3Bucket: !Sub ${CreatorFunctionS3Bucket}
+        S3Key: !Sub ${CreatorFunctionS3Key}
+
+  APIKeyCustomResource:
+    Type: Custom::TsmNodeKeys
+    Properties:
+      ServiceToken: !Sub ${APIKeyCreatorFunction.Arn}
+      NodeAPIKeySecretArn: !Sub ${NodeAPIKey}
+      NodePrivateKeySecretArn: !Sub ${NodePrivateKey}
+      NodePublicKeySecretArn: !Sub ${NodePublicKey}
 
 Outputs:
   SSMParameter:
@@ -202,3 +275,9 @@ Outputs:
   NodeMasterEncryptionKey:
     Description: The master encryption key that you use to encrypt your builder vault node
     Value: !Ref NodeMasterEncryptionKey
+  NodeSecretManagerKMSKey:
+    Description: The KMS key that you use to encrypt your builder vault node
+    Value: !Ref NodeSecretManagerKMSKey
+  ApiKeyCreatorFunction:
+    Description: "Api Key Creator ARN"
+    Value: !Ref APIKeyCreatorFunction
